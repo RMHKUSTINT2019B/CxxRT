@@ -1,0 +1,367 @@
+#pragma once
+#include "../condition_variable.hpp"
+
+namespace {
+#ifdef __arm__
+    // A 32-bit, 4-byte-aligned static data value. The least significant 2 bits must
+    // be statically initialized to 0.
+    typedef uint32_t guard_type;
+
+    inline void set_initialized(guard_type *guard_object) {
+        *guard_object |= 1;
+    }
+
+#else
+    typedef uint64_t guard_type;
+
+    void set_initialized(guard_type *guard_object) {
+        char *initialized = (char *) guard_object;
+        *initialized = 1;
+    }
+
+#endif
+
+    typedef bool lock_type;
+
+#if !defined(__arm__)
+    static_assert(std::is_same<guard_type, uint64_t>::value, "");
+
+    inline lock_type get_lock(uint64_t x) {
+        union {
+            uint64_t guard;
+            uint8_t lock[2];
+        } f = {x};
+        return f.lock[1] != 0;
+    }
+
+    inline void set_lock(uint64_t &x, lock_type y) {
+        union {
+            uint64_t guard;
+            uint8_t lock[2];
+        } f = {0};
+        f.lock[1] = y;
+        x = f.guard;
+    }
+
+#else // defined(__arm__)
+    static_assert(std::is_same<guard_type, uint32_t>::value, "");
+
+    inline lock_type get_lock(uint32_t x) {
+        union {
+            uint32_t guard;
+            uint8_t lock[2];
+        } f = {x};
+        return f.lock[1] != 0;
+    }
+
+    inline void set_lock(uint32_t &x, lock_type y) {
+        union {
+            uint32_t guard;
+            uint8_t lock[2];
+        } f = {0};
+        f.lock[1] = static_cast<uint8_t>(y);
+        x = f.guard;
+    }
+
+#endif // !defined(__arm__)
+
+    chstd::mutex guard_mut;
+    chstd::condition_variable guard_cv;
+    constexpr const char *_guard_mut_lock_fail = "cxa_guard mutex fail";
+}
+
+extern "C" {
+int __cxa_guard_acquire(guard_type *guard_object) {
+    char *initialized = (char *) guard_object;
+    chstd::unique_lock<chstd::mutex> lk(guard_mut, std::try_to_lock);
+    if (!lk)
+        chSysHalt(_guard_mut_lock_fail);
+    int result = *initialized == 0;
+    if (result) {
+        while (get_lock(*guard_object))
+            guard_cv.wait(lk);
+        result = *initialized == 0;
+        if (result)
+            set_lock(*guard_object, true);
+    }
+    return result;
+}
+
+void __cxa_guard_release(guard_type *guard_object) {
+    {
+        chstd::unique_lock<chstd::mutex> lk(guard_mut, std::try_to_lock);
+        if (!lk)
+            chSysHalt(_guard_mut_lock_fail);
+        *guard_object = 0;
+        set_initialized(guard_object);
+    }
+    guard_cv.notify_all();
+}
+
+void __cxa_guard_abort(guard_type *) {} // Exceptions disabled. Does nothing
+
+void __cxa_pure_virtual() { chSysHalt(""); }
+
+void __cxa_deleted_virtual() { chSysHalt(""); }
+
+// Kept as stub function since I don't think the program could reach here anyway
+int __cxa_atexit(void (*)(void *), void *, void *) { return 0; }
+
+int __cxa_finalize(void *) { return 0; } // same as above
+
+void __cxa_bad_cast(void) { chSysHalt(""); }
+
+void __cxa_bad_typeid(void) { chSysHalt(""); }
+
+void __cxa_throw_bad_array_new_length(void) { chSysHalt(""); }
+
+#ifndef DSO_GEN
+void *__dso_handle = nullptr;
+#endif
+}
+
+#ifdef ENABLE_CXA_VEC
+//===-------------------------- cxa_vector.cpp ---------------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is dual licensed under the MIT and the University of Illinois Open
+// Source Licenses. See LICENSE.TXT for details.
+//
+//
+//  This file implements the "Array Construction and Destruction APIs"
+//  http://mentorembedded.github.io/cxx-abi/abi.html#array-ctor
+//
+//===----------------------------------------------------------------------===//
+
+#include "../new.hpp"
+
+namespace {
+    inline static size_t __get_element_count(void *p) {
+        return static_cast <size_t *> (p)[-1];
+    }
+
+    inline static void __set_element_count(void *p, size_t element_count) {
+        static_cast <size_t *> (p)[-1] = element_count;
+    }
+
+    class st_heap_block2 {
+    public:
+        typedef void (*dealloc_f)(void *);
+
+        st_heap_block2(dealloc_f dealloc, void *ptr) : dealloc_(dealloc), ptr_(ptr), enabled_(true) {}
+
+        ~st_heap_block2() { if (enabled_) dealloc_(ptr_); }
+
+        void release() { enabled_ = false; }
+
+    private:
+        dealloc_f dealloc_;
+        void *ptr_;
+        bool enabled_;
+    };
+
+    class st_heap_block3 {
+    public:
+        typedef void (*dealloc_f)(void *, size_t);
+
+        st_heap_block3(dealloc_f dealloc, void *ptr, size_t size) : dealloc_(dealloc), ptr_(ptr), size_(size),
+                                                                    enabled_(true) {}
+
+        ~st_heap_block3() { if (enabled_) dealloc_(ptr_, size_); }
+
+        void release() { enabled_ = false; }
+
+    private:
+        dealloc_f dealloc_;
+        void *ptr_;
+        size_t size_;
+        bool enabled_;
+    };
+
+    class st_terminate {
+    public:
+        st_terminate(bool enabled = true) : enabled_(enabled) {}
+
+        ~st_terminate() { if (enabled_) chSysHalt(""); }
+
+        void release() { enabled_ = false; }
+
+    private:
+        bool enabled_;
+    };
+}
+
+extern "C" void
+__cxa_vec_cleanup(void *array_address, size_t element_count, size_t element_size, void (*destructor)(void *)) {
+    if (nullptr != destructor) {
+        char *ptr = static_cast <char *> (array_address);
+        size_t idx = element_count;
+        st_terminate exception_guard;
+
+        ptr += element_count * element_size;    // one past the last element
+        while (idx-- > 0) {
+            ptr -= element_size;
+            destructor(ptr);
+        }
+        exception_guard.release();     // We're done!
+    }
+}
+
+namespace {
+    class st_cxa_cleanup {
+    public:
+        typedef void (*destruct_f)(void *);
+
+        st_cxa_cleanup(void *ptr, size_t &idx, size_t element_size, destruct_f destructor) : ptr_(ptr), idx_(idx),
+                                                                                             element_size_(
+                                                                                                     element_size),
+                                                                                             destructor_(destructor),
+                                                                                             enabled_(true) {}
+
+        ~st_cxa_cleanup() {
+            if (enabled_)
+                __cxa_vec_cleanup(ptr_, idx_, element_size_, destructor_);
+        }
+
+        void release() { enabled_ = false; }
+
+    private:
+        void *ptr_;
+        size_t &idx_;
+        size_t element_size_;
+        destruct_f destructor_;
+        bool enabled_;
+    };
+}
+
+extern "C" {
+void __cxa_vec_cctor(void *dest_array, void *src_array, size_t element_count, size_t element_size,
+                                         void (*constructor)(void *, void *), void (*destructor)(void *)) {
+    if (nullptr != constructor) {
+        size_t idx = 0;
+        char *src_ptr = static_cast<char *>(src_array);
+        char *dest_ptr = static_cast<char *>(dest_array);
+        st_cxa_cleanup cleanup(dest_array, idx, element_size, destructor);
+
+        for (idx = 0; idx < element_count; ++idx, src_ptr += element_size, dest_ptr += element_size)
+            constructor(dest_ptr, src_ptr);
+        cleanup.release();     // We're good!
+    }
+}
+
+void __cxa_vec_ctor(void *array_address, size_t element_count, size_t element_size, void (*constructor)(void *),
+               void (*destructor)(void *)) {
+    if (nullptr != constructor) {
+        size_t idx;
+        char *ptr = static_cast <char *> ( array_address );
+        st_cxa_cleanup cleanup(array_address, idx, element_size, destructor);
+
+        //  Construct the elements
+        for (idx = 0; idx < element_count; ++idx, ptr += element_size)
+            constructor(ptr);
+        cleanup.release();     // We're good!
+    }
+}
+
+void * __cxa_vec_new2(size_t element_count, size_t element_size, size_t padding_size, void (*constructor)(void *),
+               void (*destructor)(void *), void *(*alloc)(size_t), void (*dealloc)(void *)) {
+    const size_t heap_size = element_count * element_size + padding_size;
+    char *const heap_block = static_cast<char *> ( alloc(heap_size));
+    char *vec_base = heap_block;
+
+    if (nullptr != vec_base) {
+        st_heap_block2 heap(dealloc, heap_block);
+
+        //  put the padding before the array elements
+        if (0 != padding_size) {
+            vec_base += padding_size;
+            __set_element_count(vec_base, element_count);
+        }
+
+        //  Construct the elements
+        __cxa_vec_ctor(vec_base, element_count, element_size, constructor, destructor);
+        heap.release();    // We're good!
+    }
+
+    return vec_base;
+}
+
+void * __cxa_vec_new(size_t element_count, size_t element_size, size_t padding_size, void (*constructor)(void *),
+              void (*destructor)(void *)) {
+    return __cxa_vec_new2(element_count, element_size, padding_size, constructor, destructor, &::operator new[],
+                          &::operator delete[]);
+}
+
+void * __cxa_vec_new3(size_t element_count, size_t element_size, size_t padding_size, void (*constructor)(void *),
+               void (*destructor)(void *), void *(*alloc)(size_t), void (*dealloc)(void *, size_t)) {
+    const size_t heap_size = element_count * element_size + padding_size;
+    char *const heap_block = static_cast<char *> ( alloc(heap_size));
+    char *vec_base = heap_block;
+
+    if (nullptr != vec_base) {
+        st_heap_block3 heap(dealloc, heap_block, heap_size);
+
+        //  put the padding before the array elements
+        if (0 != padding_size) {
+            vec_base += padding_size;
+            __set_element_count(vec_base, element_count);
+        }
+
+        //  Construct the elements
+        __cxa_vec_ctor(vec_base, element_count, element_size, constructor, destructor);
+        heap.release();    // We're good!
+    }
+
+    return vec_base;
+}
+
+void __cxa_vec_dtor(void *array_address, size_t element_count, size_t element_size, void (*destructor)(void *)) {
+    if (nullptr != destructor) {
+        char *ptr = static_cast <char *> (array_address);
+        size_t idx = element_count;
+        st_cxa_cleanup cleanup(array_address, idx, element_size, destructor);
+        {
+            ptr += element_count * element_size;   // one past the last element
+
+            while (idx-- > 0) {
+                ptr -= element_size;
+                destructor(ptr);
+            }
+        }
+        cleanup.release();     // We're still good!
+    }
+}
+
+void __cxa_vec_delete2(void *array_address, size_t element_size, size_t padding_size, void (*destructor)(void *),
+                  void (*dealloc)(void *)) {
+    if (nullptr != array_address) {
+        char *vec_base = static_cast <char *> (array_address);
+        char *heap_block = vec_base - padding_size;
+        st_heap_block2 heap(dealloc, heap_block);
+
+        if (0 != padding_size && nullptr != destructor) // call the destructors
+            __cxa_vec_dtor(array_address, __get_element_count(vec_base), element_size, destructor);
+    }
+}
+
+void __cxa_vec_delete3(void *array_address, size_t element_size, size_t padding_size, void (*destructor)(void *),
+                  void (*dealloc)(void *, size_t)) {
+    if (nullptr != array_address) {
+        char *vec_base = static_cast <char *> (array_address);
+        char *heap_block = vec_base - padding_size;
+        const size_t element_count = padding_size ? __get_element_count(vec_base) : 0;
+        const size_t heap_block_size = element_size * element_count + padding_size;
+        st_heap_block3 heap(dealloc, heap_block, heap_block_size);
+
+        if (0 != padding_size && nullptr != destructor) // call the destructors
+            __cxa_vec_dtor(array_address, element_count, element_size, destructor);
+    }
+}
+
+void __cxa_vec_delete(void *array_address, size_t element_size, size_t padding_size, void (*destructor)(void *)) {
+    __cxa_vec_delete2(array_address, element_size, padding_size, destructor, &::operator delete[]);
+}
+
+}// extern "C"
+#endif

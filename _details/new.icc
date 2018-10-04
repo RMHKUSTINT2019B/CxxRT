@@ -1,0 +1,31 @@
+#pragma once
+
+#include "ch.h"
+#include "../new.hpp"
+
+namespace {
+    void *_alloc(std::size_t size) noexcept { return chHeapAlloc(nullptr, size); }
+
+    void _dealloc(void *m) noexcept { chHeapFree(m); }
+}
+
+void *operator new(std::size_t s) noexcept { return _alloc(s); }
+
+void *operator new[](std::size_t s) noexcept { return _alloc(s); }
+
+void operator delete(void *m) noexcept { _dealloc(m); }
+
+void operator delete[](void *m) noexcept { _dealloc(m); }
+
+void operator delete(void* m, std::size_t) noexcept { _dealloc(m); }
+
+void operator delete[](void* m, std::size_t) noexcept { _dealloc(m); }
+
+void *operator new(std::size_t s, const std::nothrow_t &) noexcept { return _alloc(s); }
+
+void *operator new[](std::size_t s, const std::nothrow_t &) noexcept { return _alloc(s); }
+
+void operator delete(void *m, const std::nothrow_t &) noexcept { _dealloc(m); }
+
+void operator delete[](void *m, const std::nothrow_t &) noexcept { _dealloc(m); }
+
